@@ -84,13 +84,15 @@ The coordinator opens the network for 180 seconds after boot. To pair a sensor, 
 To open the network again at any time:
 
 ```bash
-curl -X POST http://192.168.1.60/api/join
+curl -X POST http://&lt;ESP_IP&gt;/api/join
 ```
+
+> Replace `<ESP_IP>` with your device's IP address (check the monitor output for `Got IP: ...`).
 
 ### 6. Query Sensors
 
 ```bash
-curl http://192.168.1.60/api/sensors
+curl http://&lt;ESP_IP&gt;/api/sensors
 ```
 
 Example response:
