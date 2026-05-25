@@ -122,6 +122,9 @@ Example response:
 
 ### `GET /api/sensors`
 
+<img width="500" height="400" alt="image" src="https://github.com/user-attachments/assets/08137cd3-f6fa-4b59-b404-689713038a3b" />
+
+
 List all tracked sensors.
 
 **Response:** JSON array of sensor objects.
