@@ -1,0 +1,29 @@
+menu "Zigbee REST Gateway Configuration"
+
+    config GATEWAY_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "myssid"
+        help
+            SSID (network name) for the Wi-Fi network to connect to.
+
+    config GATEWAY_WIFI_PASSWORD
+        string "Wi-Fi Password"
+        default "mypassword"
+        help
+            Password for the Wi-Fi network.
+
+    config GATEWAY_ZIGBEE_CHANNEL
+        int "Zigbee channel (11-26)"
+        range 11 26
+        default 13
+        help
+            Zigbee channel for the coordinator network.
+
+    config GATEWAY_MAX_SENSORS
+        int "Maximum number of tracked sensors"
+        range 1 50
+        default 10
+        help
+            Maximum number of Zigbee sensors that can be tracked simultaneously.
+
+endmenu

@@ -1,0 +1,11 @@
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults
+dependencies.lock
+managed_components/
+.env
+*.o
+*.elf
+*.bin
+*.map
