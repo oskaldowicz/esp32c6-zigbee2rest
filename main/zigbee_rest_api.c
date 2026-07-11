@@ -58,13 +58,13 @@ typedef struct {
     uint8_t ep_list[MAX_ENDPOINTS];
     uint8_t ep_count;
     int current_ep_idx;
-    int bind_step;
+    bool rediscovery;
 } discovery_ctx_t;
 
 static void discovery_alarm_cb(void *param);
-static void try_next_endpoint(discovery_ctx_t *ctx);
 static void startup_rediscover_cb(void *param);
 static void mgmt_lqi_cb(const esp_zb_zdo_mgmt_lqi_rsp_t *rsp, void *user_ctx);
+static void schedule_next_rediscovery(void);
 
 #define NVS_SENSOR_NAMESPACE "sensors"
 
@@ -126,18 +126,9 @@ static int add_or_update_sensor(uint16_t short_addr, esp_zb_ieee_addr_t ieee_add
     int idx = find_sensor_by_ieee(ieee_addr);
     if (idx >= 0) {
         if (sensors[idx].short_addr != short_addr) {
-            ESP_LOGI(TAG, "Sensor %d changed short 0x%04x -> 0x%04x, re-binding",
+            ESP_LOGI(TAG, "Sensor %d changed short 0x%04x -> 0x%04x",
                      idx, sensors[idx].short_addr, short_addr);
             sensors[idx].short_addr = short_addr;
-            discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
-            if (ctx) {
-                ctx->short_addr = short_addr;
-                memcpy(ctx->ieee_addr, ieee_addr, sizeof(esp_zb_ieee_addr_t));
-                ctx->ep_count = 0;
-                ctx->current_ep_idx = 0;
-                ctx->bind_step = 0;
-                esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 2000);
-            }
         }
         return idx;
     }
@@ -181,6 +172,7 @@ static void configure_sensor_reporting(discovery_ctx_t *ctx)
         esp_zb_zcl_config_report_cmd_t cmd = {0};
         int16_t temp_change = 50;
         uint16_t hum_change = 0;
+        uint8_t batt_change = 0;
 
         cmd.zcl_basic_cmd.dst_addr_u.addr_short = ctx->short_addr;
         cmd.zcl_basic_cmd.dst_endpoint = ep;
@@ -209,89 +201,18 @@ static void configure_sensor_reporting(discovery_ctx_t *ctx)
             record.attrType = ESP_ZB_ZCL_ATTR_TYPE_U8;
             record.min_interval = 1;
             record.max_interval = 360;
-            record.reportable_change = NULL;
+            record.reportable_change = &batt_change;
         } else {
             continue;
         }
 
-        esp_zb_zcl_config_report_cmd_req(&cmd);
-        ESP_LOGI(TAG, "Config report 0x%04x cluster 0x%04x", ctx->short_addr, cluster);
+        esp_err_t err = esp_zb_zcl_config_report_cmd_req(&cmd);
+        if (err != ESP_OK)
+            ESP_LOGE(TAG, "Config report 0x%04x cluster 0x%04x failed: %s", ctx->short_addr, cluster, esp_err_to_name(err));
+        else
+            ESP_LOGI(TAG, "Config report 0x%04x cluster 0x%04x", ctx->short_addr, cluster);
     }
     ESP_LOGI(TAG, "Configured reporting for sensor 0x%04x", ctx->short_addr);
-}
-
-static void bind_cb(esp_zb_zdp_status_t zdo_status, void *user_ctx)
-{
-    discovery_ctx_t *ctx = user_ctx;
-    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
-    ESP_LOGI(TAG, "Bind 0x%04x cluster[%d]=0x%04x ep=%d status=%d",
-             ctx->short_addr, ctx->bind_step, BIND_CLUSTER_IDS[ctx->bind_step], ep, zdo_status);
-
-    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS) {
-        ctx->current_ep_idx++;
-        ctx->bind_step = 0;
-        try_next_endpoint(ctx);
-        return;
-    }
-
-    ctx->bind_step++;
-    if (ctx->bind_step < BIND_CLUSTERS) {
-        esp_zb_zdo_bind_req_param_t req = {
-            .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
-            .cluster_id = BIND_CLUSTER_IDS[ctx->bind_step],
-            .src_endp = ep,
-            .dst_endp = GATEWAY_ENDPOINT,
-            .req_dst_addr = ctx->short_addr,
-        };
-        memcpy(req.src_address, ctx->ieee_addr, sizeof(esp_zb_ieee_addr_t));
-        esp_zb_get_long_address(req.dst_address_u.addr_long);
-        esp_zb_zdo_device_bind_req(&req, bind_cb, ctx);
-    } else {
-        int s_idx = find_sensor_by_short(ctx->short_addr);
-        if (s_idx >= 0) {
-            sensors[s_idx].bound = true;
-            ESP_LOGI(TAG, "Sensor 0x%04x fully bound", ctx->short_addr);
-        }
-        configure_sensor_reporting(ctx);
-        free(ctx);
-    }
-}
-
-static void bind_sensor_clusters(discovery_ctx_t *ctx)
-{
-    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
-    ESP_LOGI(TAG, "Binding sensor 0x%04x ep %d", ctx->short_addr, ep);
-
-    esp_zb_zdo_bind_req_param_t req = {
-        .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
-        .cluster_id = BIND_CLUSTER_IDS[0],
-        .src_endp = ep,
-        .dst_endp = GATEWAY_ENDPOINT,
-        .req_dst_addr = ctx->short_addr,
-    };
-    memcpy(req.src_address, ctx->ieee_addr, sizeof(esp_zb_ieee_addr_t));
-    esp_zb_get_long_address(req.dst_address_u.addr_long);
-    esp_zb_zdo_device_bind_req(&req, bind_cb, ctx);
-}
-
-static void try_next_endpoint(discovery_ctx_t *ctx)
-{
-    if (ctx->current_ep_idx >= ctx->ep_count) {
-        ESP_LOGE(TAG, "No valid endpoint found for 0x%04x", ctx->short_addr);
-        free(ctx);
-        return;
-    }
-    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
-    ESP_LOGI(TAG, "Trying endpoint %d for 0x%04x", ep, ctx->short_addr);
-    ctx->bind_step = 0;
-    bind_sensor_clusters(ctx);
-}
-
-static void start_binding_sequence(discovery_ctx_t *ctx)
-{
-    ctx->current_ep_idx = 0;
-    ctx->bind_step = 0;
-    try_next_endpoint(ctx);
 }
 
 static void simple_desc_cb(esp_zb_zdp_status_t status, esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx)
@@ -309,7 +230,15 @@ static void simple_desc_cb(esp_zb_zdp_status_t status, esp_zb_af_simple_desc_1_1
                          clusters[i], ep, ctx->short_addr);
                 ctx->ep_list[0] = ep;
                 ctx->ep_count = 1;
-                start_binding_sequence(ctx);
+                ctx->current_ep_idx = 0;
+                configure_sensor_reporting(ctx);
+                int s_idx = find_sensor_by_short(ctx->short_addr);
+                if (s_idx >= 0)
+                    sensors[s_idx].bound = true;
+                bool was_rediscovery = ctx->rediscovery;
+                free(ctx);
+                if (was_rediscovery)
+                    schedule_next_rediscovery();
                 return;
             }
         }
@@ -323,7 +252,10 @@ static void simple_desc_cb(esp_zb_zdp_status_t status, esp_zb_af_simple_desc_1_1
         esp_zb_zdo_simple_desc_req(&req, simple_desc_cb, ctx);
     } else {
         ESP_LOGE(TAG, "No sensor endpoint via Simple Desc for 0x%04x", ctx->short_addr);
+        bool was_rediscovery = ctx->rediscovery;
         free(ctx);
+        if (was_rediscovery)
+            schedule_next_rediscovery();
     }
 }
 
@@ -334,7 +266,15 @@ static void match_cb(esp_zb_zdp_status_t status, uint16_t addr, uint8_t endpoint
         ESP_LOGI(TAG, "Found sensor endpoint %d for 0x%04x", endpoint, addr);
         ctx->ep_list[0] = endpoint;
         ctx->ep_count = 1;
-        start_binding_sequence(ctx);
+        ctx->current_ep_idx = 0;
+        configure_sensor_reporting(ctx);
+        int s_idx = find_sensor_by_short(ctx->short_addr);
+        if (s_idx >= 0)
+            sensors[s_idx].bound = true;
+        bool was_rediscovery = ctx->rediscovery;
+        free(ctx);
+        if (was_rediscovery)
+            schedule_next_rediscovery();
     } else {
         ESP_LOGW(TAG, "Match desc failed for 0x%04x, fallback to Simple Desc", ctx->short_addr);
         ctx->current_ep_idx = 0;
@@ -346,7 +286,10 @@ static void match_cb(esp_zb_zdp_status_t status, uint16_t addr, uint8_t endpoint
             esp_zb_zdo_simple_desc_req(&req, simple_desc_cb, ctx);
         } else {
             ESP_LOGE(TAG, "No endpoints for 0x%04x", ctx->short_addr);
+            bool was_rediscovery = ctx->rediscovery;
             free(ctx);
+            if (was_rediscovery)
+                schedule_next_rediscovery();
         }
     }
 }
@@ -356,7 +299,10 @@ static void active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count, uint8_t *
     discovery_ctx_t *ctx = user_ctx;
     if (status != ESP_ZB_ZDP_STATUS_SUCCESS || ep_count == 0) {
         ESP_LOGW(TAG, "Active EP failed for 0x%04x status=%d", ctx->short_addr, status);
+        bool was_rediscovery = ctx->rediscovery;
         free(ctx);
+        if (was_rediscovery)
+            schedule_next_rediscovery();
         return;
     }
     ctx->ep_count = (ep_count > MAX_ENDPOINTS) ? MAX_ENDPOINTS : ep_count;
@@ -387,7 +333,7 @@ static void schedule_next_rediscovery(void)
                 memcpy(ctx->ieee_addr, sensors[i].ieee_addr, sizeof(esp_zb_ieee_addr_t));
                 ctx->ep_count = 0;
                 ctx->current_ep_idx = 0;
-                ctx->bind_step = 0;
+                ctx->rediscovery = true;
                 rediscovery_pending_idx = i + 1;
                 esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 2000);
             }
@@ -459,28 +405,6 @@ static void discovery_alarm_cb(void *param)
 static void update_sensor(uint16_t short_addr, uint16_t cluster, uint16_t attr_id, const void *value)
 {
     int idx = find_sensor_by_short(short_addr);
-    if (idx < 0) {
-        for (int i = 0; i < sensor_count; i++) {
-            if (sensors[i].valid && sensors[i].short_addr == 0xFFFF) {
-                sensors[i].short_addr = short_addr;
-                idx = i;
-                ESP_LOGI(TAG, "Matched report 0x%04x to NVS sensor %d", short_addr, i);
-                if (!sensors[i].bound) {
-                    discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
-                    if (ctx) {
-                        ctx->short_addr = short_addr;
-                        memcpy(ctx->ieee_addr, sensors[i].ieee_addr, sizeof(esp_zb_ieee_addr_t));
-                        ctx->ep_count = 0;
-                        ctx->current_ep_idx = 0;
-                        ctx->bind_step = 0;
-                        ESP_LOGI(TAG, "Scheduling discovery for 0x%04x after report match", short_addr);
-                        esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 1000);
-                    }
-                }
-                break;
-            }
-        }
-    }
     if (idx < 0)
         return;
     sensors[idx].last_seen = esp_timer_get_time() / 1000;
@@ -643,13 +567,34 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             xSemaphoreGive(sensor_mutex);
         }
 
+        // Immediate configure_reporting to endpoint 1 (no discovery delay)
+        if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100))) {
+            int sidx = find_sensor_by_ieee(params->ieee_addr);
+            if (sidx >= 0 && !sensors[sidx].bound) {
+                discovery_ctx_t *ictx = malloc(sizeof(discovery_ctx_t));
+                if (ictx) {
+                    ictx->short_addr = params->device_short_addr;
+                    memcpy(ictx->ieee_addr, params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                    ictx->ep_list[0] = 1;
+                    ictx->ep_count = 1;
+                    ictx->current_ep_idx = 0;
+                    ictx->rediscovery = false;
+                    configure_sensor_reporting(ictx);
+                    sensors[sidx].bound = true;
+                    free(ictx);
+                }
+            }
+            xSemaphoreGive(sensor_mutex);
+        }
+
+        // Delayed discovery as fallback (for sensors with endpoint != 1)
         discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
         if (ctx) {
             ctx->short_addr = params->device_short_addr;
             memcpy(ctx->ieee_addr, params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
             ctx->ep_count = 0;
             ctx->current_ep_idx = 0;
-            ctx->bind_step = 0;
+            ctx->rediscovery = false;
             esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 2000);
         } else {
             ESP_LOGE(TAG, "OOM for discovery_ctx");
