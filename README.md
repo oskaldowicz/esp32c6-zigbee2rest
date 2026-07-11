@@ -9,6 +9,9 @@ Zigbee coordinator for ESP32-C6 that reads wireless temperature, humidity, and b
 - **Wi-Fi connectivity** – station mode, configurable SSID/password via menuconfig
 - **Wi-Fi / Zigbee coexistence** – proper radio sharing on the C6 chip
 - **Multi-sensor support** – auto-discovery via Device Announce, deduplication by IEEE address
+- **Endpoint discovery** – Active EP + Match Cluster / Simple Desc fallback finds sensor endpoint dynamically (no hardcoded EP 1)
+- **Binding retry** – on bind failure, tries next endpoint automatically
+- **Re-binding** – triggers re-discovery when sensor changes short address (e.g. after battery swap)
 - **Sensor persistence** – IEEE addresses saved to NVS, survive power cycles
 - **Battery support** – handles both percentage (`0x0021`) and voltage (`0x0020`) reporting
 - **Push model** – sensors initiate reports when they wake, no polling needed
@@ -214,6 +217,22 @@ The coordinator must be mains-powered as it maintains the network and HTTP serve
 ### Sensor Matching
 
 Sensors are matched by **IEEE (MAC) address**, not by Zigbee short address. This prevents duplicate entries when a sensor rejoins the network with a different short address after a power cycle.
+
+### Endpoint Discovery & Binding
+
+When a sensor joins (`Device Announce`), the coordinator schedules endpoint discovery after a 2-second delay (via `esp_zb_scheduler_user_alarm`). The sequence is:
+
+1. **Active EP Request** – retrieve all endpoints on the sensor
+2. **Match Cluster** – search for an endpoint with Temperature Measurement cluster (0x0402) as input
+3. If Match Cluster succeeds → bind on that endpoint
+4. If Match Cluster fails → fallback to **Simple Descriptor** iteration over all endpoints, checking for Temp/Humidity/Power clusters
+5. On any bind failure → retry with the next endpoint in the list
+
+This replaces the original hardcoded endpoint 1, enabling compatibility with Tuya, Aqara, and other sensors that expose application clusters on endpoints 2, 3, or higher.
+
+### Re-binding
+
+When a known sensor (matching IEEE address) rejoins with a different short address (e.g. after battery replacement), the coordinator automatically schedules a new discovery + binding cycle for that sensor.
 
 ### Persistence
 

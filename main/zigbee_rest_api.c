@@ -14,6 +14,8 @@
 #include "esp_coexist.h"
 #include "esp_zigbee_core.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
+#include "zdo/esp_zigbee_zdo_command.h"
+#include "zcl/esp_zigbee_zcl_command.h"
 
 #define TAG "ZB_GW"
 
@@ -46,6 +48,20 @@ typedef struct {
 static sensor_t sensors[MAX_SENSORS];
 static int sensor_count = 0;
 static SemaphoreHandle_t sensor_mutex;
+
+#define MAX_ENDPOINTS 10
+
+typedef struct {
+    uint16_t short_addr;
+    esp_zb_ieee_addr_t ieee_addr;
+    uint8_t ep_list[MAX_ENDPOINTS];
+    uint8_t ep_count;
+    int current_ep_idx;
+    int bind_step;
+} discovery_ctx_t;
+
+static void discovery_alarm_cb(void *param);
+static void try_next_endpoint(discovery_ctx_t *ctx);
 
 #define NVS_SENSOR_NAMESPACE "sensors"
 
@@ -105,7 +121,20 @@ static int add_or_update_sensor(uint16_t short_addr, esp_zb_ieee_addr_t ieee_add
 {
     int idx = find_sensor_by_ieee(ieee_addr);
     if (idx >= 0) {
-        sensors[idx].short_addr = short_addr;
+        if (sensors[idx].short_addr != short_addr) {
+            ESP_LOGI(TAG, "Sensor %d changed short 0x%04x -> 0x%04x, re-binding",
+                     idx, sensors[idx].short_addr, short_addr);
+            sensors[idx].short_addr = short_addr;
+            discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
+            if (ctx) {
+                ctx->short_addr = short_addr;
+                memcpy(ctx->ieee_addr, ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                ctx->ep_count = 0;
+                ctx->current_ep_idx = 0;
+                ctx->bind_step = 0;
+                esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 2000);
+            }
+        }
         return idx;
     }
     if (sensor_count >= MAX_SENSORS)
@@ -128,6 +157,220 @@ static int find_sensor_by_short(uint16_t short_addr)
             return i;
     }
     return -1;
+}
+
+#define BIND_CLUSTERS 3
+
+static const uint16_t BIND_CLUSTER_IDS[BIND_CLUSTERS] = {
+    ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+    ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+    ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+};
+
+static void configure_sensor_reporting(discovery_ctx_t *ctx)
+{
+    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
+    for (int c = 0; c < BIND_CLUSTERS; c++) {
+        uint16_t cluster = BIND_CLUSTER_IDS[c];
+        esp_zb_zcl_config_report_record_t record = {0};
+        esp_zb_zcl_config_report_cmd_t cmd = {0};
+        int16_t temp_change = 50;
+        uint16_t hum_change = 0;
+
+        cmd.zcl_basic_cmd.dst_addr_u.addr_short = ctx->short_addr;
+        cmd.zcl_basic_cmd.dst_endpoint = ep;
+        cmd.zcl_basic_cmd.src_endpoint = GATEWAY_ENDPOINT;
+        cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        cmd.clusterID = cluster;
+        cmd.record_number = 1;
+        cmd.record_field = &record;
+
+        record.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
+
+        if (cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT) {
+            record.attributeID = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID;
+            record.attrType = ESP_ZB_ZCL_ATTR_TYPE_S16;
+            record.min_interval = 1;
+            record.max_interval = 60;
+            record.reportable_change = &temp_change;
+        } else if (cluster == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT) {
+            record.attributeID = ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID;
+            record.attrType = ESP_ZB_ZCL_ATTR_TYPE_U16;
+            record.min_interval = 1;
+            record.max_interval = 60;
+            record.reportable_change = &hum_change;
+        } else if (cluster == ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG) {
+            record.attributeID = ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID;
+            record.attrType = ESP_ZB_ZCL_ATTR_TYPE_U8;
+            record.min_interval = 1;
+            record.max_interval = 360;
+            record.reportable_change = NULL;
+        } else {
+            continue;
+        }
+
+        esp_zb_zcl_config_report_cmd_req(&cmd);
+        ESP_LOGI(TAG, "Config report 0x%04x cluster 0x%04x", ctx->short_addr, cluster);
+    }
+    ESP_LOGI(TAG, "Configured reporting for sensor 0x%04x", ctx->short_addr);
+}
+
+static void bind_cb(esp_zb_zdp_status_t zdo_status, void *user_ctx)
+{
+    discovery_ctx_t *ctx = user_ctx;
+    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
+    ESP_LOGI(TAG, "Bind 0x%04x cluster[%d]=0x%04x ep=%d status=%d",
+             ctx->short_addr, ctx->bind_step, BIND_CLUSTER_IDS[ctx->bind_step], ep, zdo_status);
+
+    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS) {
+        ctx->current_ep_idx++;
+        ctx->bind_step = 0;
+        try_next_endpoint(ctx);
+        return;
+    }
+
+    ctx->bind_step++;
+    if (ctx->bind_step < BIND_CLUSTERS) {
+        esp_zb_zdo_bind_req_param_t req = {
+            .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
+            .cluster_id = BIND_CLUSTER_IDS[ctx->bind_step],
+            .src_endp = ep,
+            .dst_endp = GATEWAY_ENDPOINT,
+            .req_dst_addr = ctx->short_addr,
+        };
+        memcpy(req.src_address, ctx->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+        esp_zb_get_long_address(req.dst_address_u.addr_long);
+        esp_zb_zdo_device_bind_req(&req, bind_cb, ctx);
+    } else {
+        configure_sensor_reporting(ctx);
+        free(ctx);
+    }
+}
+
+static void bind_sensor_clusters(discovery_ctx_t *ctx)
+{
+    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
+    ESP_LOGI(TAG, "Binding sensor 0x%04x ep %d", ctx->short_addr, ep);
+
+    esp_zb_zdo_bind_req_param_t req = {
+        .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
+        .cluster_id = BIND_CLUSTER_IDS[0],
+        .src_endp = ep,
+        .dst_endp = GATEWAY_ENDPOINT,
+        .req_dst_addr = ctx->short_addr,
+    };
+    memcpy(req.src_address, ctx->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+    esp_zb_get_long_address(req.dst_address_u.addr_long);
+    esp_zb_zdo_device_bind_req(&req, bind_cb, ctx);
+}
+
+static void try_next_endpoint(discovery_ctx_t *ctx)
+{
+    if (ctx->current_ep_idx >= ctx->ep_count) {
+        ESP_LOGE(TAG, "No valid endpoint found for 0x%04x", ctx->short_addr);
+        free(ctx);
+        return;
+    }
+    uint8_t ep = ctx->ep_list[ctx->current_ep_idx];
+    ESP_LOGI(TAG, "Trying endpoint %d for 0x%04x", ep, ctx->short_addr);
+    ctx->bind_step = 0;
+    bind_sensor_clusters(ctx);
+}
+
+static void start_binding_sequence(discovery_ctx_t *ctx)
+{
+    ctx->current_ep_idx = 0;
+    ctx->bind_step = 0;
+    try_next_endpoint(ctx);
+}
+
+static void simple_desc_cb(esp_zb_zdp_status_t status, esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx)
+{
+    discovery_ctx_t *ctx = user_ctx;
+    if (status == ESP_ZB_ZDP_STATUS_SUCCESS && simple_desc) {
+        uint16_t *clusters = simple_desc->app_cluster_list;
+        int total = simple_desc->app_input_cluster_count + simple_desc->app_output_cluster_count;
+        for (int i = 0; i < total; i++) {
+            if (clusters[i] == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT ||
+                clusters[i] == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT ||
+                clusters[i] == ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG) {
+                uint8_t ep = simple_desc->endpoint;
+                ESP_LOGI(TAG, "Found sensor cluster 0x%04x on ep %d for 0x%04x",
+                         clusters[i], ep, ctx->short_addr);
+                ctx->ep_list[0] = ep;
+                ctx->ep_count = 1;
+                start_binding_sequence(ctx);
+                return;
+            }
+        }
+    }
+    ctx->current_ep_idx++;
+    if (ctx->current_ep_idx < ctx->ep_count) {
+        esp_zb_zdo_simple_desc_req_param_t req = {
+            .addr_of_interest = ctx->short_addr,
+            .endpoint = ctx->ep_list[ctx->current_ep_idx],
+        };
+        esp_zb_zdo_simple_desc_req(&req, simple_desc_cb, ctx);
+    } else {
+        ESP_LOGE(TAG, "No sensor endpoint via Simple Desc for 0x%04x", ctx->short_addr);
+        free(ctx);
+    }
+}
+
+static void match_cb(esp_zb_zdp_status_t status, uint16_t addr, uint8_t endpoint, void *user_ctx)
+{
+    discovery_ctx_t *ctx = user_ctx;
+    if (status == ESP_ZB_ZDP_STATUS_SUCCESS && endpoint != 0xFF) {
+        ESP_LOGI(TAG, "Found sensor endpoint %d for 0x%04x", endpoint, addr);
+        ctx->ep_list[0] = endpoint;
+        ctx->ep_count = 1;
+        start_binding_sequence(ctx);
+    } else {
+        ESP_LOGW(TAG, "Match desc failed for 0x%04x, fallback to Simple Desc", ctx->short_addr);
+        ctx->current_ep_idx = 0;
+        if (ctx->ep_count > 0) {
+            esp_zb_zdo_simple_desc_req_param_t req = {
+                .addr_of_interest = ctx->short_addr,
+                .endpoint = ctx->ep_list[0],
+            };
+            esp_zb_zdo_simple_desc_req(&req, simple_desc_cb, ctx);
+        } else {
+            ESP_LOGE(TAG, "No endpoints for 0x%04x", ctx->short_addr);
+            free(ctx);
+        }
+    }
+}
+
+static void active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count, uint8_t *ep_id_list, void *user_ctx)
+{
+    discovery_ctx_t *ctx = user_ctx;
+    if (status != ESP_ZB_ZDP_STATUS_SUCCESS || ep_count == 0) {
+        ESP_LOGW(TAG, "Active EP failed for 0x%04x status=%d", ctx->short_addr, status);
+        free(ctx);
+        return;
+    }
+    ctx->ep_count = (ep_count > MAX_ENDPOINTS) ? MAX_ENDPOINTS : ep_count;
+    memcpy(ctx->ep_list, ep_id_list, ctx->ep_count);
+
+    static const uint16_t match_clusters[] = { ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT };
+    esp_zb_zdo_match_desc_req_param_t match = {
+        .dst_nwk_addr = ctx->short_addr,
+        .addr_of_interest = ctx->short_addr,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .num_in_clusters = 1,
+        .num_out_clusters = 0,
+        .cluster_list = (uint16_t *)match_clusters,
+    };
+    esp_zb_zdo_match_cluster(&match, match_cb, ctx);
+}
+
+static void discovery_alarm_cb(void *param)
+{
+    discovery_ctx_t *ctx = param;
+    esp_zb_zdo_active_ep_req_param_t req = {
+        .addr_of_interest = ctx->short_addr,
+    };
+    esp_zb_zdo_active_ep_req(&req, active_ep_cb, ctx);
 }
 
 static void update_sensor(uint16_t short_addr, uint16_t cluster, uint16_t attr_id, const void *value)
@@ -302,6 +545,18 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             }
             xSemaphoreGive(sensor_mutex);
         }
+
+        discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
+        if (ctx) {
+            ctx->short_addr = params->device_short_addr;
+            memcpy(ctx->ieee_addr, params->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+            ctx->ep_count = 0;
+            ctx->current_ep_idx = 0;
+            ctx->bind_step = 0;
+            esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 2000);
+        } else {
+            ESP_LOGE(TAG, "OOM for discovery_ctx");
+        }
         break;
     }
 
@@ -334,6 +589,8 @@ static void zigbee_task(void *pvParameters)
             .max_children = MAX_CHILDREN,
         },
     };
+    esp_zb_aps_src_binding_table_size_set(32);
+    esp_zb_aps_dst_binding_table_size_set(32);
     esp_zb_init(&zb_nwk_cfg);
     esp_zb_set_primary_network_channel_set(ZIGBEE_CHANNEL_MASK);
 
