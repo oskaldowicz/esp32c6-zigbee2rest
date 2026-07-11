@@ -43,6 +43,7 @@ typedef struct {
     uint8_t battery;
     int64_t last_seen;
     bool valid;
+    bool bound;
 } sensor_t;
 
 static sensor_t sensors[MAX_SENSORS];
@@ -62,6 +63,8 @@ typedef struct {
 
 static void discovery_alarm_cb(void *param);
 static void try_next_endpoint(discovery_ctx_t *ctx);
+static void startup_rediscover_cb(void *param);
+static void mgmt_lqi_cb(const esp_zb_zdo_mgmt_lqi_rsp_t *rsp, void *user_ctx);
 
 #define NVS_SENSOR_NAMESPACE "sensors"
 
@@ -98,6 +101,7 @@ static void load_sensor_list(void)
                     sensors[sensor_count].humidity = -1.0f;
                     sensors[sensor_count].battery = 0;
                     sensors[sensor_count].valid = true;
+                    sensors[sensor_count].bound = false;
                     sensors[sensor_count].last_seen = 0;
                     sensor_count++;
                 }
@@ -146,6 +150,7 @@ static int add_or_update_sensor(uint16_t short_addr, esp_zb_ieee_addr_t ieee_add
     sensors[idx].humidity = -1.0f;
     sensors[idx].battery = 0;
     sensors[idx].valid = true;
+    sensors[idx].bound = false;
     sensors[idx].last_seen = 0;
     return idx;
 }
@@ -242,6 +247,11 @@ static void bind_cb(esp_zb_zdp_status_t zdo_status, void *user_ctx)
         esp_zb_get_long_address(req.dst_address_u.addr_long);
         esp_zb_zdo_device_bind_req(&req, bind_cb, ctx);
     } else {
+        int s_idx = find_sensor_by_short(ctx->short_addr);
+        if (s_idx >= 0) {
+            sensors[s_idx].bound = true;
+            ESP_LOGI(TAG, "Sensor 0x%04x fully bound", ctx->short_addr);
+        }
         configure_sensor_reporting(ctx);
         free(ctx);
     }
@@ -364,6 +374,79 @@ static void active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count, uint8_t *
     esp_zb_zdo_match_cluster(&match, match_cb, ctx);
 }
 
+static int rediscovery_pending_idx = 0;
+
+static void schedule_next_rediscovery(void)
+{
+    for (int i = rediscovery_pending_idx; i < sensor_count; i++) {
+        if (sensors[i].valid && !sensors[i].bound && sensors[i].short_addr != 0xFFFF) {
+            ESP_LOGI(TAG, "Post-startup rediscovery for sensor %d (0x%04x)", i, sensors[i].short_addr);
+            discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
+            if (ctx) {
+                ctx->short_addr = sensors[i].short_addr;
+                memcpy(ctx->ieee_addr, sensors[i].ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                ctx->ep_count = 0;
+                ctx->current_ep_idx = 0;
+                ctx->bind_step = 0;
+                rediscovery_pending_idx = i + 1;
+                esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 2000);
+            }
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "Post-startup rediscovery complete");
+}
+
+static void mgmt_lqi_cb(const esp_zb_zdo_mgmt_lqi_rsp_t *rsp, void *user_ctx)
+{
+    if (rsp->status != 0) {
+        ESP_LOGW(TAG, "Mgmt LQI failed status=%d", rsp->status);
+        return;
+    }
+    ESP_LOGI(TAG, "Mgmt LQI: %d neighbors (total %d, start %d)",
+             rsp->neighbor_table_list_count, rsp->neighbor_table_entries, rsp->start_index);
+
+    for (uint8_t i = 0; i < rsp->neighbor_table_list_count; i++) {
+        const esp_zb_zdo_neighbor_table_list_record_t *record = &rsp->neighbor_table_list[i];
+        const uint8_t *ieee = record->extended_addr;
+        ESP_LOGI(TAG, "  Neighbor 0x%04x IEEE=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                 record->network_addr,
+                 ieee[0], ieee[1], ieee[2], ieee[3],
+                 ieee[4], ieee[5], ieee[6], ieee[7]);
+
+        for (int j = 0; j < sensor_count; j++) {
+            if (sensors[j].valid && !sensors[j].bound &&
+                memcmp(sensors[j].ieee_addr, record->extended_addr, sizeof(esp_zb_ieee_addr_t)) == 0) {
+                if (sensors[j].short_addr == 0xFFFF) {
+                    sensors[j].short_addr = record->network_addr;
+                    ESP_LOGI(TAG, "Resolved short_addr for sensor %d: 0x%04x", j, record->network_addr);
+                }
+                break;
+            }
+        }
+    }
+
+    uint8_t next_start = rsp->start_index + rsp->neighbor_table_list_count;
+    if (next_start < rsp->neighbor_table_entries) {
+        esp_zb_zdo_mgmt_lqi_req_param_t req = { .start_index = next_start, .dst_addr = 0x0000 };
+        esp_zb_zdo_mgmt_lqi_req(&req, mgmt_lqi_cb, NULL);
+        return;
+    }
+
+    rediscovery_pending_idx = 0;
+    schedule_next_rediscovery();
+}
+
+static void startup_rediscover_cb(void *param)
+{
+    ESP_LOGI(TAG, "Starting post-startup sensor rediscovery via Mgmt LQI");
+    esp_zb_zdo_mgmt_lqi_req_param_t req = {
+        .start_index = 0,
+        .dst_addr = 0x0000,
+    };
+    esp_zb_zdo_mgmt_lqi_req(&req, mgmt_lqi_cb, NULL);
+}
+
 static void discovery_alarm_cb(void *param)
 {
     discovery_ctx_t *ctx = param;
@@ -382,6 +465,18 @@ static void update_sensor(uint16_t short_addr, uint16_t cluster, uint16_t attr_i
                 sensors[i].short_addr = short_addr;
                 idx = i;
                 ESP_LOGI(TAG, "Matched report 0x%04x to NVS sensor %d", short_addr, i);
+                if (!sensors[i].bound) {
+                    discovery_ctx_t *ctx = malloc(sizeof(discovery_ctx_t));
+                    if (ctx) {
+                        ctx->short_addr = short_addr;
+                        memcpy(ctx->ieee_addr, sensors[i].ieee_addr, sizeof(esp_zb_ieee_addr_t));
+                        ctx->ep_count = 0;
+                        ctx->current_ep_idx = 0;
+                        ctx->bind_step = 0;
+                        ESP_LOGI(TAG, "Scheduling discovery for 0x%04x after report match", short_addr);
+                        esp_zb_scheduler_user_alarm(discovery_alarm_cb, ctx, 1000);
+                    }
+                }
                 break;
             }
         }
@@ -502,6 +597,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 esp_zb_bdb_open_network(180);
                 ESP_LOGI(TAG, "Device rebooted, PAN=0x%04x restored, network open for 180s",
                          esp_zb_get_pan_id());
+                esp_zb_scheduler_user_alarm(startup_rediscover_cb, NULL, 10000);
             }
         } else {
             ESP_LOGE(TAG, "Failed to initialize Zigbee stack: %s", esp_err_to_name(err_status));
@@ -516,6 +612,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(),
                      esp_zb_get_short_address());
             esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            esp_zb_scheduler_user_alarm(startup_rediscover_cb, NULL, 10000);
         } else {
             esp_zb_scheduler_alarm(bdb_start_top_level_commissioning_cb,
                                    ESP_ZB_BDB_MODE_NETWORK_FORMATION, 1000);
